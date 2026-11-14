@@ -74,6 +74,17 @@ def estimate_logit_sigma(series: Sequence[float]) -> float:
 REVERSION_WEIGHT: float = 0.30
 REVERSION_TAU: float = 240.0
 REVERSION_LOOKBACK: int = 720
+MIX_WEIGHT: float = 0.20
+LAPLACE_SCALE: float = 0.15
+
+
+def laplace_multiplier(tau: float) -> float:
+    """Return the standard Laplace quantile multiplier for level tau in (0, 1)."""
+    diff = tau - 0.5
+    if diff == 0.0:
+        return 0.0
+    sign = 1.0 if diff > 0.0 else -1.0
+    return sign * (-math.log(1.0 - 2.0 * abs(diff)))
 
 
 def build_market_quantiles(
@@ -94,18 +105,21 @@ def build_market_quantiles(
     long_mean = sum(long_tail) / len(long_tail) if long_tail else eta
 
     rows: list[list[float]] = []
+    taus = (0.05, 0.25, 0.5, 0.75, 0.95)
     for h in range(1, horizon_minutes + 1):
         step_spread = sigma * (h ** HORIZON_POWER)
         pull = (1.0 - math.exp(-h / REVERSION_TAU)) * REVERSION_WEIGHT
         centre = eta + pull * (long_mean - eta)
         row: list[float] = []
         prev_q = 0.0
-        for z in NORMAL_Z_SCORES:
+        for z, tau in zip(NORMAL_Z_SCORES, taus):
             k = INNER_SCALE if abs(z) < 1.0 else OUTER_SCALE
-            band = sigmoid(centre + z * step_spread * k)
+            q = sigmoid(centre + z * step_spread * k)
             if abs(z) >= 1.0:
-                band += TAIL_OFFSET if z > 0.0 else -TAIL_OFFSET
-            q = clamp_unit(band, 0.0, 1.0)
+                q += TAIL_OFFSET if z > 0.0 else -TAIL_OFFSET
+            q_laplace = sigmoid(centre + LAPLACE_SCALE * laplace_multiplier(tau))
+            q = (1.0 - MIX_WEIGHT) * q + MIX_WEIGHT * q_laplace
+            q = clamp_unit(q, 0.0, 1.0)
             if q < prev_q:
                 q = prev_q
             row.append(q)
