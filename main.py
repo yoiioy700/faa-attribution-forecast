@@ -1,90 +1,125 @@
-"""Offline quantile forecaster for polymarket-faa-attribution-02 (FAA outage attribution markets)."""
+"""Logit-space random walk quantile forecaster for polymarket-faa-attribution-02."""
+
+from __future__ import annotations
 
 import json
 import math
 import os
 from pathlib import Path
-import statistics
-from typing import Any
-
-# Standard normal z-scores for the five quantile levels: 5%, 25%, 50%, 75%, and 95%.
-QUANTILES_Z: tuple[float, ...] = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
-SIGMA_CENTRE: float = 0.40
-SIGMA_TAIL: float = 0.60
-HORIZON_EXP: float = 0.45
-JUMP: float = 0.006
-SHRINK: float = 600.0
-VOL_WINDOW: int = 240
-MIN_VOL_SAMPLES: int = 10
-LOGIT_EPS: float = 1e-4
+from statistics import median
+from typing import Any, Final, Sequence, TypedDict
 
 
-def clip(value: float, lower: float, upper: float) -> float:
-    """Clamp a floating-point number into [lower, upper]."""
-    return max(lower, min(upper, value))
+class MarketForecast(TypedDict):
+    """Output record for a single Polymarket condition."""
+
+    id: str
+    q: list[list[float]]
 
 
-def logit(price: float) -> float:
-    """Map a price in (0, 1) to the real line."""
-    p = clip(price, LOGIT_EPS, 1.0 - LOGIT_EPS)
-    return math.log(p / (1.0 - p))
+DEFAULT_INPUT_DIR: Final[str] = "/input"
+DEFAULT_OUTPUT_DIR: Final[str] = "/output"
+DEFAULT_HORIZON: Final[int] = 240
+LOOKBACK_MINUTES: Final[int] = 240
+MIN_SAMPLE_LEN: Final[int] = 10
+SHRINKAGE_WEIGHT: Final[float] = 600.0
+HORIZON_POWER: Final[float] = 0.45
+INNER_SCALE: Final[float] = 0.40
+OUTER_SCALE: Final[float] = 0.60
+TAIL_OFFSET: Final[float] = 0.006
+PRICE_CLAMP_EPS: Final[float] = 1e-4
+VAR_FLOOR: Final[float] = 1e-12
+NORMAL_Z_SCORES: Final[tuple[float, float, float, float, float]] = (
+    -1.644854,
+    -0.67449,
+    0.0,
+    0.67449,
+    1.644854,
+)
 
 
-def logistic(value: float) -> float:
-    """Inverse of logit."""
-    return 1.0 / (1.0 + math.exp(-value))
+def clamp_unit(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    """Restrict a floating-point value to the closed interval [lo, hi]."""
+    if val < lo:
+        return lo
+    if val > hi:
+        return hi
+    return val
 
 
-def recent_volatility(prices: list[float]) -> float:
-    """Standard deviation of 1-minute logit changes over the recent window."""
-    tail = [logit(p) for p in prices[-VOL_WINDOW:]]
-    if len(tail) < MIN_VOL_SAMPLES:
+def to_logit(prob: float) -> float:
+    """Transform a probability in (0, 1) into log-odds space."""
+    bounded = clamp_unit(prob, PRICE_CLAMP_EPS, 1.0 - PRICE_CLAMP_EPS)
+    return math.log(bounded / (1.0 - bounded))
+
+
+def sigmoid(eta: float) -> float:
+    """Map a log-odds value back to probability space (0, 1)."""
+    return 1.0 / (1.0 + math.exp(-eta))
+
+
+def estimate_logit_sigma(series: Sequence[float]) -> float:
+    """Compute sample standard deviation of up to 240 one-minute logit changes."""
+    logit_tail = [to_logit(float(p)) for p in series[-LOOKBACK_MINUTES:]]
+    if len(logit_tail) < MIN_SAMPLE_LEN:
         return 0.0
-    diffs = [tail[idx] - tail[idx - 1] for idx in range(1, len(tail))]
-    mean = sum(diffs) / len(diffs)
-    var = sum((d - mean) ** 2 for d in diffs) / (len(diffs) - 1)
-    return math.sqrt(max(var, 1e-12))
+    deltas = [
+        logit_tail[i] - logit_tail[i - 1] for i in range(1, len(logit_tail))
+    ]
+    mean_delta = sum(deltas) / len(deltas)
+    sample_var = sum((d - mean_delta) ** 2 for d in deltas) / (len(deltas) - 1)
+    return math.sqrt(max(sample_var, VAR_FLOOR))
 
 
-def forecast_market_rows(
-    prices: list[float],
-    ref_vol: float,
-    horizon: int,
+def build_market_quantiles(
+    prices: Sequence[float],
+    case_median_sigma: float,
+    horizon_minutes: int = DEFAULT_HORIZON,
 ) -> list[list[float]]:
-    """Return horizon rows of [q05, q25, q50, q75, q95] for a single market."""
-    count = len(prices)
-    sigma = recent_volatility(prices)
-    sigma = math.sqrt((count * sigma * sigma + SHRINK * ref_vol * ref_vol) / (count + SHRINK))
-    eta = logit(float(prices[-1]))
+    """Build 240 rows of five non-decreasing quantiles in [0, 1] for one market."""
+    n_obs = float(len(prices))
+    raw_sigma = estimate_logit_sigma(prices)
+    shrunk_var = (
+        n_obs * raw_sigma * raw_sigma
+        + SHRINKAGE_WEIGHT * case_median_sigma * case_median_sigma
+    ) / (n_obs + SHRINKAGE_WEIGHT)
+    sigma = math.sqrt(shrunk_var)
+    eta = to_logit(float(prices[-1]))
 
     rows: list[list[float]] = []
-    for step in range(1, horizon + 1):
-        base = sigma * (step ** HORIZON_EXP)
-        quantiles: list[float] = []
-        for idx, z_val in enumerate(QUANTILES_Z):
-            k = SIGMA_CENTRE if abs(z_val) < 1.0 else SIGMA_TAIL
-            q_val = logistic(eta + z_val * base * k)
-            if idx in (0, 4):
-                q_val += JUMP if z_val > 0 else -JUMP
-            q_val = clip(q_val, 0.0, 1.0)
-            if quantiles and q_val < quantiles[-1]:
-                q_val = quantiles[-1]
-            quantiles.append(q_val)
-        rows.append(quantiles)
+    for h in range(1, horizon_minutes + 1):
+        step_spread = sigma * (h ** HORIZON_POWER)
+        row: list[float] = []
+        prev_q = 0.0
+        for z in NORMAL_Z_SCORES:
+            k = INNER_SCALE if abs(z) < 1.0 else OUTER_SCALE
+            band = sigmoid(eta + z * step_spread * k)
+            if abs(z) >= 1.0:
+                band += TAIL_OFFSET if z > 0.0 else -TAIL_OFFSET
+            q = clamp_unit(band, 0.0, 1.0)
+            if q < prev_q:
+                q = prev_q
+            row.append(q)
+            prev_q = q
+        rows.append(row)
     return rows
 
 
-def process_case(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Generate forecasts for all markets in a single evaluation case."""
-    horizon = int(payload.get("horizon_minutes", 240))
-    markets: list[dict[str, Any]] = payload["markets"]
-    vols = [recent_volatility(m["prices"]) for m in markets]
-    ref_vol = float(statistics.median(vols)) if vols else 0.0
+def forecast_case(
+    case_payload: dict[str, Any],
+) -> dict[str, list[MarketForecast]]:
+    """Produce forecast output dictionary for all markets in a single case."""
+    horizon = int(case_payload.get("horizon_minutes", DEFAULT_HORIZON))
+    markets: list[dict[str, Any]] = list(case_payload["markets"])
+    market_sigmas = [estimate_logit_sigma(m["prices"]) for m in markets]
+    median_sigma = float(median(market_sigmas)) if market_sigmas else 0.0
 
-    forecasts: list[dict[str, Any]] = [
+    forecasts: list[MarketForecast] = [
         {
             "id": str(market["id"]),
-            "q": forecast_market_rows(market["prices"], ref_vol, horizon),
+            "q": build_market_quantiles(
+                market["prices"], median_sigma, horizon
+            ),
         }
         for market in markets
     ]
@@ -92,16 +127,16 @@ def process_case(payload: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
 
 
 def main() -> None:
-    """Iterate sorted .in files in MAKEFUN_INPUT_DIR and write .out files."""
-    input_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Read every *.in in MAKEFUN_INPUT_DIR in sorted order and write <case>.out."""
+    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", DEFAULT_INPUT_DIR))
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    for in_file in sorted(input_dir.glob("*.in")):
-        case_data: dict[str, Any] = json.loads(in_file.read_text(encoding="utf-8"))
-        out_data = process_case(case_data)
-        out_file = output_dir / f"{in_file.stem}.out"
-        out_file.write_text(json.dumps(out_data), encoding="utf-8")
+    for in_path in sorted(in_dir.glob("*.in")):
+        payload: dict[str, Any] = json.loads(in_path.read_text(encoding="utf-8"))
+        result = forecast_case(payload)
+        out_path = out_dir / f"{in_path.stem}.out"
+        out_path.write_text(json.dumps(result), encoding="utf-8")
 
 
 if __name__ == "__main__":
