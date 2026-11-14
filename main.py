@@ -71,6 +71,11 @@ def estimate_logit_sigma(series: Sequence[float]) -> float:
     return math.sqrt(max(sample_var, VAR_FLOOR))
 
 
+REVERSION_WEIGHT: float = 0.30
+REVERSION_TAU: float = 240.0
+REVERSION_LOOKBACK: int = 720
+
+
 def build_market_quantiles(
     prices: Sequence[float],
     case_median_sigma: float,
@@ -85,15 +90,19 @@ def build_market_quantiles(
     ) / (n_obs + SHRINKAGE_WEIGHT)
     sigma = math.sqrt(shrunk_var)
     eta = to_logit(float(prices[-1]))
+    long_tail = [to_logit(float(p)) for p in prices[-REVERSION_LOOKBACK:]]
+    long_mean = sum(long_tail) / len(long_tail) if long_tail else eta
 
     rows: list[list[float]] = []
     for h in range(1, horizon_minutes + 1):
         step_spread = sigma * (h ** HORIZON_POWER)
+        pull = (1.0 - math.exp(-h / REVERSION_TAU)) * REVERSION_WEIGHT
+        centre = eta + pull * (long_mean - eta)
         row: list[float] = []
         prev_q = 0.0
         for z in NORMAL_Z_SCORES:
             k = INNER_SCALE if abs(z) < 1.0 else OUTER_SCALE
-            band = sigmoid(eta + z * step_spread * k)
+            band = sigmoid(centre + z * step_spread * k)
             if abs(z) >= 1.0:
                 band += TAIL_OFFSET if z > 0.0 else -TAIL_OFFSET
             q = clamp_unit(band, 0.0, 1.0)
