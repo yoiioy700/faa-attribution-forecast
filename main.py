@@ -1,4 +1,4 @@
-"""Offline quantile forecaster for the Polymarket NVIDIA CEO make.fun bounty."""
+"""Offline quantile forecaster for polymarket-faa-attribution-02 (FAA outage attribution markets)."""
 
 import json
 import math
@@ -7,6 +7,7 @@ from pathlib import Path
 import statistics
 from typing import Any
 
+# Standard normal z-scores for the five quantile levels: 5%, 25%, 50%, 75%, and 95%.
 QUANTILES_Z: tuple[float, ...] = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
 SIGMA_CENTRE: float = 0.40
 SIGMA_TAIL: float = 0.60
